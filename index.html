@@ -21,12 +21,15 @@
   .ctl output { text-align:right; font-variant-numeric:tabular-nums; color:var(--mute); }
   input[type=range] { width:100%; }
   #ctls { margin-top:22px; }
+  details { margin-top:22px; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 14px 14px; }
+  summary { cursor:pointer; font-weight:600; }
+  canvas#cEq { height:140px; margin-top:10px; }
 </style>
 </head>
 <body>
 <main>
   <h1>Waveshaping Bass</h1>
-  <p class="intro">A low saw wave runs through a transfer function you draw. A second drawn curve scrolls across it slowly and is added on top. Every change fades in. Use headphones: phone speakers can't play 45 Hz.</p>
+  <p class="intro">A low saw wave runs through a transfer function you draw. A second drawn curve scrolls across it slowly and is added on top. Every change fades in. Reverb and EQ panels sit below. Use headphones: phone speakers can't play 45 Hz.</p>
   <button id="go">Start sound</button>
 
   <figure>
@@ -43,6 +46,16 @@
   </figure>
 
   <div id="ctls"></div>
+
+  <details open>
+    <summary>Reverb</summary>
+    <div id="rvCtls"></div>
+  </details>
+  <details open>
+    <summary>EQ</summary>
+    <canvas id="cEq"></canvas>
+    <div id="eqCtls"></div>
+  </details>
 </main>
 
 <script>
@@ -53,10 +66,66 @@ const modT  = mk(i => Math.sin(i / N * 2 * Math.PI) * 0.3);
 let base = baseT.slice(), mod = modT.slice(), eff = baseT.slice();   // faded versions in use
 let phase = 0;
 
-const P = { freq: 45, drive: 1.5, amp: 0.3, modFreq: 0.1, lag: 10 };
+const P = { freq: 45, drive: 1.5, amp: 0.3, modFreq: 0.1, lag: 10,
+            rvMix: 0.35, rvDecay: 12, rvPre: 40, rvDamp: 5000, rvLow: 150 };
+[80, 250, 2000, 6000].forEach((f, i) => { P["eq" + i + "f"] = f; P["eq" + i + "g"] = 0; });
 
 // ---------- audio ----------
-let ctx = null, osc, pre, shaper, hp, out;
+let ctx = null, osc, pre, shaper, hp, out, eqF = [], dry, dly, conv, wLow, wHigh, wet, irTimer;
+
+// long, dense, stereo reverb tail: decaying noise that gets darker over time
+function makeIR(c, decay) {
+  const sr = c.sampleRate, len = Math.floor(sr * decay * 1.2), buf = c.createBuffer(2, len, sr);
+  const g = Math.pow(10, -3 / (decay * sr));            // -60 dB after 'decay' seconds
+  const ga = Math.exp(-1 / (sr * decay * 0.25));        // brightness falls over time
+  for (let ch = 0; ch < 2; ch++) {
+    const d = buf.getChannelData(ch); let y = 0, env = 1, a = 0.9;
+    for (let i = 0; i < len; i++) {
+      y += (0.1 + a) * ((Math.random() * 2 - 1) - y) * 0.5;
+      d[i] = y * env * Math.min(1, i / (sr * 0.2));     // soft 0.2 s build-up
+      env *= g; a *= ga;
+    }
+  }
+  return buf;
+}
+function scheduleIR() {
+  clearTimeout(irTimer);
+  irTimer = setTimeout(() => { if (ctx) conv.buffer = makeIR(ctx, P.rvDecay); }, 250);
+}
+function setMix() {
+  if (!ctx) return;
+  dry.gain.value = Math.cos(P.rvMix * Math.PI / 2);
+  wet.gain.value = Math.sin(P.rvMix * Math.PI / 2);
+}
+
+// EQ: four bands; a separate offline context only draws the response curve
+const eqTypes = ["lowshelf", "peaking", "peaking", "highshelf"];
+const dispF = eqTypes.map((t, i) => {
+  const b = new OfflineAudioContext(1, 1, 44100).createBiquadFilter();
+  b.type = t; b.frequency.value = P["eq" + i + "f"]; b.gain.value = P["eq" + i + "g"]; return b;
+});
+function setEq(i, param, v) {
+  dispF[i][param].value = v;
+  if (eqF[i]) eqF[i][param].value = v;
+}
+function drawEq() {
+  const cv = document.getElementById("cEq"), dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const g = cv.getContext("2d"), M = 200;
+  const fr = new Float32Array(M), mag = new Float32Array(M), ph = new Float32Array(M), tot = new Float32Array(M).fill(1);
+  for (let i = 0; i < M; i++) fr[i] = 20 * Math.pow(1000, i / (M - 1));
+  dispF.forEach(f => { f.getFrequencyResponse(fr, mag, ph); for (let i = 0; i < M; i++) tot[i] *= mag[i]; });
+  g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, w, h);
+  g.strokeStyle = "#cfd6dd"; g.lineWidth = 1; g.beginPath();
+  for (const db of [-12, -6, 0, 6, 12]) { const y = h / 2 - db / 18 * (h / 2); g.moveTo(0, y); g.lineTo(w, y); }
+  g.stroke();
+  g.strokeStyle = "#c2410c"; g.lineWidth = 2.5; g.beginPath();
+  for (let i = 0; i < M; i++) {
+    const y = h / 2 - Math.max(-18, Math.min(18, 20 * Math.log10(tot[i]))) / 18 * (h / 2);
+    i ? g.lineTo(i / (M - 1) * w, y) : g.moveTo(0, y);
+  }
+  g.stroke();
+}
 
 function startAudio() {
   ctx = new AudioContext();
@@ -65,7 +134,22 @@ function startAudio() {
   shaper = ctx.createWaveShaper(); shaper.oversample = "4x"; shaper.curve = eff;
   hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 8;   // removes DC from asymmetric curves
   out = ctx.createGain(); out.gain.value = P.amp;
-  osc.connect(pre); pre.connect(shaper); shaper.connect(hp); hp.connect(out); out.connect(ctx.destination);
+  eqF = eqTypes.map((t, i) => {
+    const b = ctx.createBiquadFilter(); b.type = t; b.Q.value = 1;
+    b.frequency.value = P["eq" + i + "f"]; b.gain.value = P["eq" + i + "g"]; return b;
+  });
+  dry = ctx.createGain();
+  dly = ctx.createDelay(0.5); dly.delayTime.value = P.rvPre / 1000;
+  conv = ctx.createConvolver(); conv.buffer = makeIR(ctx, P.rvDecay);
+  wLow = ctx.createBiquadFilter(); wLow.type = "highpass"; wLow.frequency.value = P.rvLow;     // keeps the bass out of the tail
+  wHigh = ctx.createBiquadFilter(); wHigh.type = "lowpass"; wHigh.frequency.value = P.rvDamp;
+  wet = ctx.createGain();
+  setMix();
+  osc.connect(pre); pre.connect(shaper); shaper.connect(hp);
+  hp.connect(eqF[0]); eqF[0].connect(eqF[1]); eqF[1].connect(eqF[2]); eqF[2].connect(eqF[3]);
+  eqF[3].connect(dry); dry.connect(out);
+  eqF[3].connect(dly); dly.connect(conv); conv.connect(wLow); wLow.connect(wHigh); wHigh.connect(wet); wet.connect(out);
+  out.connect(ctx.destination);
   osc.start();
 }
 function stopAudio() { if (ctx) { ctx.close(); ctx = null; } }
@@ -84,8 +168,7 @@ const defs = [
   ["modFreq", "Scroll (cycles/s)", -0.5, 0.5, false, v => v.toFixed(3), null],
   ["lag",     "Fade time (s)",    0.5, 40,  true,  v => v.toFixed(1), null],
 ];
-const ctls = document.getElementById("ctls");
-defs.forEach(([key, label, lo, hi, log, fmt, apply]) => {
+const addSliders = (box, list) => list.forEach(([key, label, lo, hi, log, fmt, apply]) => {
   const row = document.createElement("div"); row.className = "ctl";
   const id = "s_" + key;
   const toPos = v => log ? Math.log(v / lo) / Math.log(hi / lo) : (v - lo) / (hi - lo);
@@ -95,8 +178,27 @@ defs.forEach(([key, label, lo, hi, log, fmt, apply]) => {
     <output>${fmt(P[key])}</output>`;
   const input = row.querySelector("input"), o = row.querySelector("output");
   input.oninput = () => { P[key] = fromPos(input.value / 1000); o.textContent = fmt(P[key]); if (apply) apply(P[key]); };
-  ctls.appendChild(row);
+  box.appendChild(row);
 });
+addSliders(document.getElementById("ctls"), defs);
+
+const f2 = v => v.toFixed(2), hz = v => Math.round(v) + " Hz";
+addSliders(document.getElementById("rvCtls"), [
+  ["rvMix",   "Mix",            0, 1,     false, f2, setMix],
+  ["rvDecay", "Decay (s)",      2, 25,    true,  v => v.toFixed(1), scheduleIR],
+  ["rvPre",   "Pre-delay (ms)", 0, 250,   false, v => Math.round(v) + " ms", v => dly && (dly.delayTime.value = v / 1000)],
+  ["rvDamp",  "Damping",        800, 16000, true, hz, v => wHigh && (wHigh.frequency.value = v)],
+  ["rvLow",   "Low cut",        20, 600,  true,  hz, v => wLow && (wLow.frequency.value = v)],
+]);
+
+const eqNames = ["Low shelf", "Low mid", "High mid", "High shelf"];
+const eqRange = [[30, 300], [100, 1000], [500, 6000], [2000, 16000]];
+const eqDefs = [];
+eqNames.forEach((nm, i) => {
+  eqDefs.push(["eq" + i + "f", nm + " freq", eqRange[i][0], eqRange[i][1], true, hz, v => { setEq(i, "frequency", v); drawEq(); }]);
+  eqDefs.push(["eq" + i + "g", nm + " gain", -15, 15, false, v => v.toFixed(1) + " dB", v => { setEq(i, "gain", v); drawEq(); }]);
+});
+addSliders(document.getElementById("eqCtls"), eqDefs);
 
 // ---------- drawing ----------
 function draw(cv, lines, grid = true) {
@@ -122,6 +224,7 @@ function redraw() {
   draw(cBase, [[baseT, "#2b6cb0", 2]]);
   draw(cMod,  [[modT,  "#2b6cb0", 2]]);
   draw(cEff,  [[base, "#98a3ae", 1.5], [eff, "#c2410c", 2.5]]);
+  drawEq();
 }
 
 function editor(cv, arr) {
