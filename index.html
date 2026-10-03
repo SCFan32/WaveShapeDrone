@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waveshaping Bass</title>
+<style>
+  :root { --bg:#eef1f4; --panel:#fff; --ink:#17212b; --mute:#5d6b79; --line:#cfd6dd; --draw:#2b6cb0; --out:#c2410c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif; }
+  main { max-width:680px; margin:0 auto; padding:20px 16px 48px; }
+  h1 { font-size:1.5rem; margin:0 0 4px; }
+  p.intro { margin:0 0 16px; color:var(--mute); max-width:60ch; }
+  button { font:inherit; padding:10px 22px; border:0; border-radius:6px; background:var(--ink); color:#fff; cursor:pointer; }
+  button:focus-visible, input:focus-visible { outline:3px solid var(--draw); outline-offset:2px; }
+  figure { margin:18px 0 0; }
+  figcaption { font-size:.9rem; color:var(--mute); margin-bottom:4px; }
+  canvas { display:block; width:100%; height:200px; background:var(--panel); border:1px solid var(--line); border-radius:6px; }
+  canvas.ed { cursor:crosshair; touch-action:none; }
+  .ctl { display:grid; grid-template-columns:110px 1fr 70px; gap:8px; align-items:center; margin-top:10px; }
+  .ctl output { text-align:right; font-variant-numeric:tabular-nums; color:var(--mute); }
+  input[type=range] { width:100%; }
+  #ctls { margin-top:22px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Waveshaping Bass</h1>
+  <p class="intro">A low saw wave runs through a transfer function you draw. A second drawn curve scrolls across it slowly and is added on top. Every change fades in. Use headphones: phone speakers can't play 45 Hz.</p>
+  <button id="go">Start sound</button>
+
+  <figure>
+    <figcaption>Base transfer function (draw here)</figcaption>
+    <canvas id="cBase" class="ed"></canvas>
+  </figure>
+  <figure>
+    <figcaption>Modulation (draw here; scrolls right and wraps)</figcaption>
+    <canvas id="cMod" class="ed"></canvas>
+  </figure>
+  <figure>
+    <figcaption>Transfer function in use (grey: faded base, orange: base plus modulation, clipped)</figcaption>
+    <canvas id="cEff"></canvas>
+  </figure>
+
+  <div id="ctls"></div>
+</main>
+
+<script>
+const N = 512;
+const mk = f => Float32Array.from({ length: N }, (_, i) => f(i));
+const baseT = mk(i => Math.tanh((i / (N - 1) * 2 - 1) * 3));   // what you draw
+const modT  = mk(i => Math.sin(i / N * 2 * Math.PI) * 0.3);
+let base = baseT.slice(), mod = modT.slice(), eff = baseT.slice();   // faded versions in use
+let phase = 0;
+
+const P = { freq: 45, drive: 1.5, amp: 0.3, modFreq: 0.1, lag: 10 };
+
+// ---------- audio ----------
+let ctx = null, osc, pre, shaper, hp, out;
+
+function startAudio() {
+  ctx = new AudioContext();
+  osc = ctx.createOscillator(); osc.type = "sawtooth"; osc.frequency.value = P.freq;
+  pre = ctx.createGain(); pre.gain.value = P.drive;           // values beyond +-1 clamp to the curve ends
+  shaper = ctx.createWaveShaper(); shaper.oversample = "4x"; shaper.curve = eff;
+  hp = ctx.createBiquadFilter(); hp.type = "highpass"; hp.frequency.value = 8;   // removes DC from asymmetric curves
+  out = ctx.createGain(); out.gain.value = P.amp;
+  osc.connect(pre); pre.connect(shaper); shaper.connect(hp); hp.connect(out); out.connect(ctx.destination);
+  osc.start();
+}
+function stopAudio() { if (ctx) { ctx.close(); ctx = null; } }
+
+const go = document.getElementById("go");
+go.onclick = () => {
+  if (ctx) { stopAudio(); go.textContent = "Start sound"; }
+  else { startAudio(); go.textContent = "Stop sound"; }
+};
+
+// ---------- sliders ----------
+const defs = [
+  ["freq",    "Pitch (Hz)",       25, 120,  true,  v => v.toFixed(1), v => ctx && (osc.frequency.value = v)],
+  ["drive",   "Drive",            0.1, 2.5, false, v => v.toFixed(2), v => ctx && (pre.gain.value = v)],
+  ["amp",     "Volume",           0, 0.6,   false, v => v.toFixed(2), v => ctx && (out.gain.value = v)],
+  ["modFreq", "Scroll (cycles/s)", -0.5, 0.5, false, v => v.toFixed(3), null],
+  ["lag",     "Fade time (s)",    0.5, 40,  true,  v => v.toFixed(1), null],
+];
+const ctls = document.getElementById("ctls");
+defs.forEach(([key, label, lo, hi, log, fmt, apply]) => {
+  const row = document.createElement("div"); row.className = "ctl";
+  const id = "s_" + key;
+  const toPos = v => log ? Math.log(v / lo) / Math.log(hi / lo) : (v - lo) / (hi - lo);
+  const fromPos = p => log ? lo * Math.pow(hi / lo, p) : lo + p * (hi - lo);
+  row.innerHTML = `<label for="${id}">${label}</label>
+    <input id="${id}" type="range" min="0" max="1000" value="${Math.round(toPos(P[key]) * 1000)}">
+    <output>${fmt(P[key])}</output>`;
+  const input = row.querySelector("input"), o = row.querySelector("output");
+  input.oninput = () => { P[key] = fromPos(input.value / 1000); o.textContent = fmt(P[key]); if (apply) apply(P[key]); };
+  ctls.appendChild(row);
+});
+
+// ---------- drawing ----------
+function draw(cv, lines, grid = true) {
+  const dpr = window.devicePixelRatio || 1, w = cv.clientWidth, h = cv.clientHeight;
+  if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const g = cv.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.strokeStyle = "#cfd6dd"; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(0, h / 2); g.lineTo(w, h / 2); g.moveTo(w / 2, 0); g.lineTo(w / 2, h); g.stroke();
+  for (const [arr, color, width] of lines) {
+    g.strokeStyle = color; g.lineWidth = width; g.beginPath();
+    for (let i = 0; i < N; i++) {
+      const x = i / (N - 1) * w, y = (1 - (arr[i] + 1) / 2) * h;
+      i ? g.lineTo(x, y) : g.moveTo(x, y);
+    }
+    g.stroke();
+  }
+}
+
+const cBase = document.getElementById("cBase"), cMod = document.getElementById("cMod"), cEff = document.getElementById("cEff");
+function redraw() {
+  draw(cBase, [[baseT, "#2b6cb0", 2]]);
+  draw(cMod,  [[modT,  "#2b6cb0", 2]]);
+  draw(cEff,  [[base, "#98a3ae", 1.5], [eff, "#c2410c", 2.5]]);
+}
+
+function editor(cv, arr) {
+  let lastI = null, lastV = 0;
+  const apply = e => {
+    const r = cv.getBoundingClientRect();
+    const i = Math.max(0, Math.min(N - 1, Math.round((e.clientX - r.left) / r.width * (N - 1))));
+    const v = Math.max(-1, Math.min(1, 1 - 2 * (e.clientY - r.top) / r.height));
+    if (lastI === null) arr[i] = v;
+    else {
+      const a = Math.min(lastI, i), b = Math.max(lastI, i);
+      for (let k = a; k <= b; k++) arr[k] = b === a ? v : lastV + (v - lastV) * ((k - lastI) / (i - lastI));
+    }
+    lastI = i; lastV = v;
+    redraw();
+  };
+  cv.addEventListener("pointerdown", e => { cv.setPointerCapture(e.pointerId); lastI = null; apply(e); });
+  cv.addEventListener("pointermove", e => { if (e.buttons) apply(e); });
+  cv.addEventListener("pointerup", () => { lastI = null; });
+}
+editor(cBase, baseT);
+editor(cMod, modT);
+
+// ---------- fade + scroll loop (30 Hz); display redraws at 10 fps ----------
+let last = performance.now(), tick = 0;
+setInterval(() => {
+  const now = performance.now(), dt = Math.min((now - last) / 1000, 0.25); last = now;
+  const coef = Math.exp(-dt / Math.max(P.lag / 5, 0.001));    // about 99% arrived after the fade time
+  phase = (((phase + P.modFreq * dt) % 1) + 1) % 1;
+  const s = phase * N, i0 = Math.floor(s), f = s - i0;
+  for (let i = 0; i < N; i++) {
+    base[i] = baseT[i] + (base[i] - baseT[i]) * coef;
+    mod[i]  = modT[i]  + (mod[i]  - modT[i])  * coef;
+  }
+  for (let i = 0; i < N; i++) {
+    const j = (i - i0 + N) % N, k = (j - 1 + N) % N;
+    const m = mod[j] * (1 - f) + mod[k] * f;                  // fractional scroll to the right
+    eff[i] = Math.max(-1, Math.min(1, base[i] + m));
+  }
+  if (shaper) shaper.curve = eff;
+  if (++tick % 3 === 0) redraw();
+}, 1000 / 30);
+
+window.addEventListener("resize", redraw);
+redraw();
+</script>
+</body>
+</html>
